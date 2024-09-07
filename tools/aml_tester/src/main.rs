@@ -30,10 +30,7 @@ enum CompilationOutcome {
 }
 
 fn main() -> std::io::Result<()> {
-    log::set_logger(&Logger).unwrap();
-    log::set_max_level(log::LevelFilter::Trace);
-
-    let matches = clap::Command::new("aml_tester")
+    let mut cmd = clap::Command::new("aml_tester")
         .version("v0.1.0")
         .author("Isaac Woods")
         .about("Compiles and tests ASL files")
@@ -41,8 +38,15 @@ fn main() -> std::io::Result<()> {
         .arg(Arg::new("reset").long("reset").action(ArgAction::SetTrue).help("Clear namespace after each file"))
         .arg(Arg::new("path").short('p').long("path").required(false).action(ArgAction::Set).value_name("DIR"))
         .arg(Arg::new("files").action(ArgAction::Append).value_name("FILE.{asl,aml}"))
-        .group(ArgGroup::new("files_list").args(["path", "files"]).required(true))
-        .get_matches();
+        .group(ArgGroup::new("files_list").args(["path", "files"]).required(true));
+    if std::env::args().count() <= 1 {
+        cmd.print_help()?;
+        return Ok(());
+    }
+    log::set_logger(&Logger).unwrap();
+    log::set_max_level(log::LevelFilter::Trace);
+
+    let matches = cmd.get_matches();
 
     // Get an initial list of files - may not work correctly on non-UTF8 OsString
     let files: Vec<String> = if matches.contains_id("path") {
@@ -103,14 +107,35 @@ fn main() -> std::io::Result<()> {
             _ => (passed, failed),
         });
         if passed + failed > 0 {
-            println!("Compiled {} ASL files: {} passed, {} failed.", passed + failed, passed, failed);
+            println!(
+                "Compiled {} ASL files: {}{} passed{}, {}{} failed{}",
+                passed + failed,
+                termion::color::Fg(termion::color::Green),
+                passed,
+                termion::style::Reset,
+                termion::color::Fg(termion::color::Red),
+                failed,
+                termion::style::Reset
+            );
             println!();
         }
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    enum TestResult {
+        /// The test passed.
+        Pass,
+        /// The test ASL failed compilation by `iasl`.
+        CompileFail,
+        /// Our interpreter failed to parse the resulting AML.
+        ParseFail,
+        // TODO: should we do this??
+        NotCompiled,
+    }
+
     // Make a list of the files we have processed, and skip them if we see them again
     let mut dedup_list: HashSet<PathBuf> = HashSet::new();
-
+    let mut summaries: HashSet<(PathBuf, TestResult)> = HashSet::new();
     // Filter down to the final list of AML files
     let aml_files = compiled_files
         .iter()
@@ -118,9 +143,15 @@ fn main() -> std::io::Result<()> {
             CompilationOutcome::IsAml(path) => Some(path.clone()),
             CompilationOutcome::Newer(path) => Some(path.clone()),
             CompilationOutcome::Succeeded(path) => Some(path.clone()),
-            CompilationOutcome::Ignored | CompilationOutcome::Failed(_) | CompilationOutcome::NotCompiled(_) => {
+            CompilationOutcome::Failed(path) => {
+                summaries.insert((path.clone(), TestResult::CompileFail));
                 None
             }
+            CompilationOutcome::NotCompiled(path) => {
+                summaries.insert((path.clone(), TestResult::NotCompiled));
+                None
+            }
+            CompilationOutcome::Ignored => None,
         })
         .filter(|path| {
             if dedup_list.contains(path) {
@@ -129,16 +160,20 @@ fn main() -> std::io::Result<()> {
                 dedup_list.insert(path.clone());
                 true
             }
-        });
+        })
+        .collect::<Vec<_>>();
 
     let user_wants_reset = matches.get_flag("reset");
     let mut context = AmlContext::new(Box::new(Handler), DebugVerbosity::None);
 
-    let (passed, failed) = aml_files.fold((0, 0), |(passed, failed), file_entry| {
+    let (passed, failed) = aml_files.into_iter().fold((0, 0), |(passed, failed), file_entry| {
         print!("Testing AML file: {:?}... ", file_entry);
         std::io::stdout().flush().unwrap();
 
-        let mut file = File::open(file_entry).unwrap();
+        let Ok(mut file) = File::open(&file_entry) else {
+            summaries.insert((file_entry, TestResult::CompileFail));
+            return (passed, failed + 1);
+        };
         let mut contents = Vec::new();
         file.read_to_end(&mut contents).unwrap();
 
@@ -152,18 +187,47 @@ fn main() -> std::io::Result<()> {
             Ok(()) => {
                 println!("{}OK{}", termion::color::Fg(termion::color::Green), termion::style::Reset);
                 println!("Namespace: {:#?}", context.namespace);
+                summaries.insert((file_entry, TestResult::Pass));
                 (passed + 1, failed)
             }
 
             Err(err) => {
                 println!("{}Failed ({:?}){}", termion::color::Fg(termion::color::Red), err, termion::style::Reset);
                 println!("Namespace: {:#?}", context.namespace);
+                summaries.insert((file_entry, TestResult::ParseFail));
                 (passed, failed + 1)
             }
         }
     });
 
-    println!("Test results: {} passed, {} failed", passed, failed);
+    // Print summaries
+    println!("Summary:");
+    for (file, status) in summaries.iter() {
+        let status = match status {
+            TestResult::Pass => {
+                format!("{}OK{}", termion::color::Fg(termion::color::Green), termion::style::Reset)
+            }
+            TestResult::CompileFail => {
+                format!("{}COMPILE FAIL{}", termion::color::Fg(termion::color::Red), termion::style::Reset)
+            }
+            TestResult::ParseFail => {
+                format!("{}PARSE FAIL{}", termion::color::Fg(termion::color::Red), termion::style::Reset)
+            }
+            TestResult::NotCompiled => {
+                format!("{}NOT COMPILED{}", termion::color::Fg(termion::color::Red), termion::style::Reset)
+            }
+        };
+        println!("\t{:<50}: {}", file.to_str().unwrap(), status);
+    }
+    println!(
+        "\nTest results: {}{} passed{}, {}{} failed{}",
+        termion::color::Fg(termion::color::Green),
+        passed,
+        termion::style::Reset,
+        termion::color::Fg(termion::color::Red),
+        failed,
+        termion::style::Reset
+    );
     Ok(())
 }
 
